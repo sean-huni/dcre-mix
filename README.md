@@ -6,7 +6,7 @@ ISR response reader for DCRE Mandates: ingests one pain.012 ISR acceptance leg i
 
 MIX is the structural-accept leg of the mandates response flow (`MIX | MSX | MPX -> mnd_ext_status -> MRG`). Fintegrate (simulated by dcre-infra `fint_sim_reply.py --mandate`) drops a reply file into a per-client `fint-resp-man/in` exchange directory; AGT selects the reader by the `_ISR` filename token and launches MIX as a short-lived Kubernetes Job. MIX parses the reply (one `<OrgnlMsgId>` plus `<MndtReqId>`, `<MndtId>`, `<MndtSts>` and an optional `<Rsn>`, [SYNTHETIC-CONTRACT R-35/A-60] shape), correlates it fail-closed to the MRW outbound registry, and writes exactly one `man_isr_resp` row. Replaying the same file is a no-op via `INSERT ... ON CONFLICT (response_file, mndt_req_id) DO NOTHING`.
 
-**Launch contract (CHANGED, SCRUM-91).** MIX takes `input.file` and `original.name` and **NO `reply.type` parameter**. The leg is a compile-time property of the service, not a launch argument: MIX only ever writes `man_isr_resp`. The merged three-table reader that selected its table from `reply.type` was MAR's shape, and splitting it into three single-leg readers (MIX/MSX/MPX, mirroring the collections IXR/SXR/PXR fleet) is what this refactor exists to do. A DAG cannot mis-route a leg it cannot name.
+**Launch contract (CHANGED, SCRUM-91).** MIX takes `input.file` and `original.name` and **NO `reply.type` parameter**. The leg is a compile-time property of the service, not a launch argument: MIX only ever writes `man_isr_resp`. The merged three-table reader that selected its table from `reply.type` was MAR's shape, and splitting it into three single-leg readers (MIX/MSX/MPX, mirroring the collections CIX/CSX/CPX fleet) is what this refactor exists to do. A DAG cannot mis-route a leg it cannot name.
 
 ## Architecture and principles
 
@@ -25,9 +25,11 @@ Spring Boot 4.1.0 / Spring Batch 6 / Java 25 on CockroachDB v26.2.3 (PostgreSQL 
 
 `man_isr_resp` (Liquibase `db/changelog/2026/07/001-man-isr-resp.xml`): `response_file`, `orgnl_msg_id`, `mndt_id`, `mndt_req_id`, `e2e` (nullable, the current synthetic contract carries no `EndToEndId`), `status`, `reason` (nullable), plus `BaseEntity` columns (`version`, `created_at`, `updated_at`); `UNIQUE (response_file, mndt_req_id)`.
 
-The table and its unique constraint are SEPARATE changesets, each guarded on the schema state it transforms (`tableExists` and `indexExists`). The table changed owning service (`mar -> mix`) and changelog filename, so on an already-migrated database its identity is new while the table already exists: the `MARK_RAN` guard converges it without re-executing DDL. Folding the constraint into the same changeset would MARK_RAN it too on a half-migrated database, silently leaving the runtime `ON CONFLICT` with nothing to arbitrate on.
+The changelog is a v1 baseline (SCRUM-107): every DCRE database is dropped and recreated for the direct cut-over, so there is no migrated database, no checksum history and no retrofit. The `MARK_RAN` guards that remain are CONVERGENCE guards against a second creator of the same object on a brand-new `dcre_man`. `man_isr_resp` has two creators: this service, and MRG's bootstrap pre-create in `mrg 004-man-views.xml`, because MRG is clock-launched and may run first. Nothing serializes the ten M-service migrations of the one shared database, so either order is legal and the loser's changesets `MARK_RAN`.
 
-Shared-core shapes (`account`, `account_type`, `mandate`, ...) come from `000-man-core-bootstrap.xml`, whose changesets are bootstrap guards, not ownership claims. `man_outbound` is MRW-owned and never shipped here. Batch metadata lives in `MIX_BATCH_`-prefixed tables (`dcre.batch.table-prefix`, read by platform-batch `BatchJdbcConfig`) via a Liquibase-owned copy of the Spring Batch 6 DDL (`002-batch-metadata.xml` loading `batch-metadata-mix.sql`, `EXIT_MESSAGE` widened to TEXT); Batch never auto-initializes its own schema. Liquibase history on the shared DB is per-service: `mix_databasechangelog` / `mix_databasechangeloglock`.
+The table and its unique constraint are SEPARATE changesets, each guarded on the schema state it transforms (`tableExists` and `indexExists`). MRG mints both together, so both of MIX's changesets converge as a pair when MRG wins; the split exists so that a creator which ever lands the table alone still gets the constraint. Folded into one changeset, the single `tableExists` gate would `MARK_RAN` the constraint as well against a table standing without it, silently leaving the runtime `ON CONFLICT` with nothing to arbitrate on.
+
+Shared-core shapes (`account`, `account_type`, `mandate_reason_code`) come from `000-man-core-bootstrap.xml`, whose changesets are convergence guards against the `dcre-infra` seed and the sibling M-services, not ownership claims. v1 does not create the `mandate` projection at all: it had no writer and no reader. `man_outbound` is MRW-owned and never shipped here. Batch metadata lives in `MIX_BATCH_`-prefixed tables (`dcre.batch.table-prefix`, read by platform-batch `BatchJdbcConfig`) via a Liquibase-owned copy of the Spring Batch 6 DDL in pure typed XML (`002-batch-metadata.xml`, `EXIT_MESSAGE` widened to TEXT); Batch never auto-initializes its own schema. Liquibase history on the shared DB is per-service: `mix_databasechangelog` / `mix_databasechangeloglock`.
 
 ## Prerequisites
 
@@ -77,11 +79,11 @@ JobParameters: `arrival.id` (identifying, R-16), `input.file` and `original.name
 ./gradlew test   # needs Docker
 ```
 
-One Testcontainers CockroachDB container serves the whole module (`AbstractCrdbIT.CRDB`); suites are isolated by disjoint fixture keys, and the migration harness mints a virgin database per test.
+One Testcontainers CockroachDB container serves the whole module (`AbstractCrdbIT.CRDB`); suites are isolated by disjoint fixture keys, and the convergence harness mints a virgin database per test.
 
 - `MixJobTest`: the real `mixJob` through `JobOperator` on Testcontainers CockroachDB `v26.2.3`; a job launched with nothing but the file lands the ISR leg, a rejected leg keeps its reason code, and a replay under a fresh job instance stays at one row.
 - `MixReaderIT`: reader proofs against real CRDB; the ingest lands in the one owned table, correlation persists every reply field, an unknown outbound identity is WARNed and excluded with nothing written, and a re-ingest is a zero-duplicate no-op preserving row identity.
-- `MixLegacyStateIT`: migration proofs against legacy database states, not just fresh containers; fresh DB, the MAR legacy end-state, the half-migrated state (table without the unique constraint, which must gain it and keep `ON CONFLICT` working), and double-apply.
+- `MixConvergenceIT`: v1 convergence proofs for the two creators of `man_isr_resp` (this service and MRG's bootstrap pre-create in `mrg 004-man-views.xml`), on a virgin database per test; MIX winning the race, MRG's table-plus-constraint pre-create converging to `MARK_RAN`, a partial pre-create still gaining the unique constraint so `ON CONFLICT` keeps arbitrating, and double-apply.
 - `MandateReplyParserTest`: pure-parser proofs; mandatory correlation/verdict fields, optional `Rsn`, opportunistic `e2e` capture, and malformed replies failing the job.
 - `ReaderServiceLegTest`: the leg is fixed to `man_isr_resp` at compile time.
 - `CucumberSuiteTest`: business-readable BDD scenarios in `src/test/resources/features/mix-acceptance-reader.feature` (correlated accept, reject reason, fail-closed exclusion, malformed reply).
@@ -98,4 +100,4 @@ The image is `eclipse-temurin:25-jre-alpine`. AGT launches MIX as an ephemeral K
 
 ## Related repositories
 
-Mandates DAG: dcre-mrr, dcre-mrv, dcre-mas, dcre-mit, dcre-mir, dcre-mrw, dcre-mix (this repo), dcre-msx, dcre-mpx, dcre-mrg. Orchestrator: dcre-agt. Collections counterparts this fleet mirrors: dcre-ixr, dcre-sxr, dcre-pxr. Platform libs: dcre-platform-model, dcre-platform-files, dcre-platform-batch, dcre-platform-persistence. Support: dcre-infra, dcre-design-register, dcre-fixture-toolkit.
+Mandates DAG: dcre-mrr, dcre-mrv, dcre-mas, dcre-mit, dcre-mir, dcre-mrw, dcre-mix (this repo), dcre-msx, dcre-mpx, dcre-mrg. Orchestrator: dcre-agt. Collections counterparts this fleet mirrors: dcre-cix, dcre-csx, dcre-cpx. Platform libs: dcre-platform-model, dcre-platform-files, dcre-platform-batch, dcre-platform-persistence. Support: dcre-infra, dcre-design-register, dcre-fixture-toolkit.

@@ -11,16 +11,17 @@ import org.testcontainers.utility.DockerImageName;
 import java.util.UUID;
 
 /**
- * Migration-proof harness: a real CRDB (the same v26.2.3 image and the same
+ * Convergence-proof harness: a real CRDB (the same v26.2.3 image and the same
  * {@code static { start() }} bootstrap the Spring suites here use), but with NO
  * Spring context, so Liquibase runs ONLY when a test asks it to. That is the
- * whole point: a legacy-state proof has to seed the pre-change schema BEFORE the
- * first migration, which a context-managed Liquibase would already have run.
+ * whole point: a convergence proof has to seed the other creator's objects BEFORE
+ * MIX's first run, which a context-managed Liquibase would already have done.
  *
- * <p>Each test gets a VIRGIN database on the shared container, so a fresh-DB
- * fixture and a legacy-end-state fixture never see each other's Liquibase
- * history (testing.md: migration changes are tested against legacy database
- * states, not only fresh containers).
+ * <p>Each test gets a VIRGIN database on the shared container, so a MIX-first
+ * fixture and an MRG-pre-created fixture never see each other's Liquibase history.
+ * V1 (SCRUM-107) leaves no migrated databases anywhere, so what is proven here is
+ * the unserialized race between the ten M-services that share one dcre_man, not a
+ * historic schema.
  *
  * <p>SINGLETON CONTAINER (SCRUM-91 review R6): {@link #CRDB} is the ONE CockroachDB
  * this whole module's test run starts, and every Spring suite points its

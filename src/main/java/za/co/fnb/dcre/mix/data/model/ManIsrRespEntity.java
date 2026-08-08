@@ -24,7 +24,7 @@ import za.co.fnb.dcre.platform.persistence.BaseEntity;
 @Table(ManIsrRespEntity.TABLE)
 public class ManIsrRespEntity extends BaseEntity {
 
-    /** The ONE response table this service owns. MIX is the ISR leg (mirror of collections IXR). */
+    /** The ONE response table this service owns. MIX is the ISR leg (mirror of collections CIX). */
     public static final String TABLE = "man_isr_resp";
 
     private String responseFile;
