@@ -5,16 +5,25 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * SCRUM-91 changeset-identity guard: man_isr_resp changed owning service (mar -> mix) and
- * changelog filename, so on a live DB the table already exists. The guarded changeset must
- * MARK_RAN, never re-execute DDL. Four fixtures: fresh DB, legacy end-state (table already
- * present from mar), half-migrated (table without the unique constraint), double-apply.
+ * SCRUM-107 v1 convergence proofs for {@code man_isr_resp}. Every DCRE database is dropped and
+ * recreated for the direct cut-over, so there is no migrated database and no MAR-era table: what
+ * these fixtures model is a SECOND CREATOR on a brand-new dcre_man, not history.
+ *
+ * <p>man_isr_resp has exactly two creators. MIX's own 001-man-isr-resp.xml, and MRG's bootstrap
+ * pre-create in mrg 004-man-views.xml ({@code 004-bootstrap-man-isr-resp-mrg}), which mints the
+ * table and the unique constraint together because MRG is clock-launched and may run before MIX
+ * has ever executed. All ten M-services migrate the one dcre_man with ten independent history
+ * tables and nothing serializes them, so either order is legal: whichever runs first creates, and
+ * the other side's guarded changesets MARK_RAN.
  */
-class MixLegacyStateIT extends AbstractCrdbIT {
+class MixConvergenceIT extends AbstractCrdbIT {
 
-    /** The shape MAR's mar-001-man-isr-resp left behind on every already-migrated database. */
-    private static final String LEGACY_ISR_TABLE = """
-            CREATE TABLE IF NOT EXISTS man_isr_resp (
+    /**
+     * MRG's pre-create, byte-for-byte in shape: table AND unique constraint in one changeset.
+     * This is the state MIX finds when MRG wins the race on a brand-new database.
+     */
+    private static final String MRG_PRECREATED_ISR_TABLE = """
+            CREATE TABLE man_isr_resp (
               id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
               response_file VARCHAR(128) NOT NULL, orgnl_msg_id VARCHAR(35) NOT NULL,
               mndt_id VARCHAR(35) NOT NULL, mndt_req_id VARCHAR(35) NOT NULL,
@@ -25,15 +34,16 @@ class MixLegacyStateIT extends AbstractCrdbIT {
               CONSTRAINT uq_man_isr_resp_file_mndt_req UNIQUE (response_file, mndt_req_id))""";
 
     /**
-     * The HALF-MIGRATED shape (SCRUM-91 review R5): the table stands but the unique
-     * constraint does not. One precondition guarding both statements MARK_RANs the
-     * whole changeset here, leaving the runtime ON CONFLICT (response_file,
-     * mndt_req_id) with no constraint to arbitrate on, so the idempotency guarantee
-     * is silently gone. The constraint gets its own changeset guarded on the schema
-     * state IT transforms.
+     * A PARTIAL pre-create: the table stands, its unique constraint does not. No creator in the
+     * fleet produces this today (MRG mints both in one changeset), so this fixture is not a
+     * database state that exists anywhere. It is the red-proof of the guard SPLIT: with one
+     * tableExists gate over both statements, MIX would MARK_RAN the whole changeset here and
+     * leave the runtime {@code ON CONFLICT (response_file, mndt_req_id)} with no constraint to
+     * arbitrate on, silently losing the zero-duplicate guarantee. Guarding the constraint on the
+     * schema state IT transforms is what makes any partial pre-create converge.
      */
-    private static final String HALF_MIGRATED_ISR_TABLE = """
-            CREATE TABLE IF NOT EXISTS man_isr_resp (
+    private static final String PARTIAL_PRECREATE_TABLE_ONLY = """
+            CREATE TABLE man_isr_resp (
               id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
               response_file VARCHAR(128) NOT NULL, orgnl_msg_id VARCHAR(35) NOT NULL,
               mndt_id VARCHAR(35) NOT NULL, mndt_req_id VARCHAR(35) NOT NULL,
@@ -49,8 +59,8 @@ class MixLegacyStateIT extends AbstractCrdbIT {
             ON CONFLICT (response_file, mndt_req_id) DO NOTHING""";
 
     @Test
-    void aHalfMigratedTableGainsTheUniqueConstraintAndOnConflictStillArbitrates() throws Exception {
-        jdbc.execute(HALF_MIGRATED_ISR_TABLE);
+    void aPartialPreCreateGainsTheUniqueConstraintAndOnConflictStillArbitrates() throws Exception {
+        jdbc.execute(PARTIAL_PRECREATE_TABLE_ONLY);
 
         runLiquibase();
         runLiquibase();
@@ -68,8 +78,8 @@ class MixLegacyStateIT extends AbstractCrdbIT {
     }
 
     @Test
-    void preCreatedIsrTableMarksTheChangesetRan() throws Exception {
-        jdbc.execute(LEGACY_ISR_TABLE);
+    void mrgPreCreatedTableAndConstraintBothConvergeToMarkRan() throws Exception {
+        jdbc.execute(MRG_PRECREATED_ISR_TABLE);
 
         runLiquibase();
         runLiquibase();
@@ -79,16 +89,26 @@ class MixLegacyStateIT extends AbstractCrdbIT {
                 .as("the constraint already stands, so its own guard converges too")
                 .isEqualTo("MARK_RAN");
         assertThat(countIndexesOn("man_isr_resp")).isEqualTo(2);
+
+        assertThat(jdbc.update(GUARDED_INSERT)).isOne();
+        assertThat(jdbc.update(GUARDED_INSERT))
+                .as("MIX's runtime write must still be a zero-duplicate no-op on MRG's copy")
+                .isZero();
     }
 
     @Test
-    void aFreshDatabaseExecutesTheChangesetAndDoubleApplyIsANoOp() throws Exception {
+    void mixWinningTheRaceExecutesBothChangesetsAndDoubleApplyIsANoOp() throws Exception {
         runLiquibase();
         runLiquibase();
 
         assertThat(execTypeOf("mix-001-man-isr-resp")).isEqualTo("EXECUTED");
         assertThat(execTypeOf("mix-001-man-isr-resp-uq")).isEqualTo("EXECUTED");
         assertThat(countIndexesOn("man_isr_resp")).isEqualTo(2);
+
+        assertThat(jdbc.update(GUARDED_INSERT)).isOne();
+        assertThat(jdbc.update(GUARDED_INSERT))
+                .as("the v1 primary path must arbitrate ON CONFLICT exactly as a converged one does")
+                .isZero();
     }
 
     @Test

@@ -5,6 +5,22 @@
         xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
         http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
 
+    <!-- V1 BASELINE (SCRUM-107, owner directive 2026-08-08). Every DCRE database is dropped and
+         recreated for the direct cut-over, so this master describes a first-ever migration, not a
+         migration path: three files, applied in order, against an empty dcre_man.
+
+           000-man-core-bootstrap.xml  shared reference core (account_type, account,
+                                       mandate_reason_code), byte-identical across all ten
+                                       M-services;
+           001-man-isr-resp.xml        man_isr_resp, the ISR acceptance-leg response table MIX is
+                                       the sole runtime writer of;
+           002-batch-metadata.xml      the MIX_BATCH_ Spring Batch metadata, pure typed XML.
+
+         No file was removed from this list by the v1 refactor: nothing here became empty. The only
+         MARK_RAN guards left in the tree are convergence guards against a SECOND creator of the
+         same object on a brand-new database (the infra seed, or a sibling M-service migrating the
+         one shared dcre_man); each says so at its changeset. -->
+
     <include file="db/changelog/2026/07/000-man-core-bootstrap.xml"/>
     <include file="db/changelog/2026/07/001-man-isr-resp.xml"/>
     <include file="db/changelog/2026/07/002-batch-metadata.xml"/>
