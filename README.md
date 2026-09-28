@@ -1,8 +1,12 @@
 # dcre-mix
 
+> Part of the DCRE fleet. For the fleet map, the rulings and the diagrams that specify every stage, start at the [DCRE design register](https://github.com/sean-huni/dcre-design-register); the complete list of live repositories is its [Repositories](https://github.com/sean-huni/dcre-design-register#repositories) table.
+
 ISR response reader for DCRE Mandates: ingests one pain.012 ISR acceptance leg into `man_isr_resp`, one verdict row per reply file.
 
 ## What it does
+
+**Position in the fleet.** Stage `MIX`, mandates family, RES leg, arrival-launched. AGT (`RouteDags.FINT_RESP_MAN`, route `fint-resp-man`, flow `MAN`) holds the mandates response DAG as three token-picked leg readers, `MIX`, `MSX` and `MPX`, with no fixed entry, no successor edges and no responder: the `_ISR` filename token selects `MIX`, exactly one reader runs per reply arrival, and it is terminal for that arrival. A reply with no recognised token launches nothing and the arrival stays open for the reconciler (fail closed). Upstream: `MRW`, whose `man_outbound` registry every reply must correlate to. Downstream: no DAG successor; `MRG` (clock-launched) reads `man_isr_resp` through `mnd_isr_pick` and `mnd_ext_status`. Diagram sheet: `dcre-mandates-res` in the design register.
 
 MIX is the structural-accept leg of the mandates response flow (`MIX | MSX | MPX -> mnd_ext_status -> MRG`). Fintegrate (simulated by dcre-infra `fint_sim_reply.py --mandate`) drops a reply file into a per-client `fint-resp-man/in` exchange directory; AGT selects the reader by the `_ISR` filename token and launches MIX as a short-lived Kubernetes Job. MIX parses the reply (one `<OrgnlMsgId>` plus `<MndtReqId>`, `<MndtId>`, `<MndtSts>` and an optional `<Rsn>`, [SYNTHETIC-CONTRACT R-35/A-60] shape), correlates it fail-closed to the MRW outbound registry, and writes exactly one `man_isr_resp` row. Replaying the same file is a no-op via `INSERT ... ON CONFLICT (response_file, mndt_req_id) DO NOTHING`.
 
@@ -10,7 +14,7 @@ MIX is the structural-accept leg of the mandates response flow (`MIX | MSX | MPX
 
 ## Architecture and principles
 
-Spring Boot 4.1.0 / Spring Batch 6 / Java 25 on CockroachDB v26.2.3 (PostgreSQL driver). An ephemeral batch job, not a server: `ExitCodeMain` (platform-batch) wires the Batch outcome into the JVM exit code (R-34).
+Spring Boot 4.1.0 / Spring Batch 6 / Java 25 on CockroachDB (PostgreSQL driver; tests pin `v26.2.3`). An ephemeral batch job, not a server: `ExitCodeMain` (platform-batch) wires the Batch outcome into the JVM exit code (R-34).
 
 - **SOLID, 3-tier, layer-first packages**: `ReaderTasklet` is a thin entry adapter (no SQL, no parsing) that reads `input.file` and calls one business-tier method; `ReaderService` parses, correlates and writes; persistence happens only through `data/repo/ManRespRepo` (Spring Data JDBC, `ManIsrRespEntity` extends the platform `BaseEntity`). Packages: `config`, `service`, `domain`, `data/model`, `data/repo`.
 - **One literal names the write target**: `ManIsrRespEntity.TABLE` is read by the `@Table` mapping, by the guarded insert's native `@Query`, and by `ReaderService.TARGET_TABLE`. There is no second table literal to drift out of step, so the leg assertion and the actual write target cannot disagree. On a live `dcre_man` all three leg tables exist, which is exactly what makes a drifted literal a SILENT cross-leg write rather than a loud failure.
@@ -23,6 +27,8 @@ Spring Boot 4.1.0 / Spring Batch 6 / Java 25 on CockroachDB v26.2.3 (PostgreSQL 
 
 ### Data
 
+Database today: the shared mandates database `dcre_man` (primary datasource `DCRE_DB_URL`, `DCRE_DB_USER`, `DCRE_DB_PASSWORD`), plus `agt_ops` for the platform-batch heartbeat (`DCRE_AGTOPS_DB_URL`, `DCRE_AGTOPS_DB_USER`, `DCRE_AGTOPS_DB_PASSWORD`). Writes: `man_isr_resp`, the `MIX_BATCH_*` metadata tables and its Liquibase history tables, plus the guarded shared-core creates and seeds below. Reads: `man_outbound` (MRW-owned, `SELECT id FROM man_outbound WHERE out_msg_id = ?`) for correlation. MIX performs no `spine_state` transition.
+
 `man_isr_resp` (Liquibase `db/changelog/2026/07/001-man-isr-resp.xml`): `response_file`, `orgnl_msg_id`, `mndt_id`, `mndt_req_id`, `e2e` (nullable, the current synthetic contract carries no `EndToEndId`), `status`, `reason` (nullable), plus `BaseEntity` columns (`version`, `created_at`, `updated_at`); `UNIQUE (response_file, mndt_req_id)`.
 
 The changelog is a v1 baseline (SCRUM-107): every DCRE database is dropped and recreated for the direct cut-over, so there is no migrated database, no checksum history and no retrofit. The `MARK_RAN` guards that remain are CONVERGENCE guards against a second creator of the same object on a brand-new `dcre_man`. `man_isr_resp` has two creators: this service, and MRG's bootstrap pre-create in `mrg 004-man-views.xml`, because MRG is clock-launched and may run first. Nothing serializes the ten M-service migrations of the one shared database, so either order is legal and the loser's changesets `MARK_RAN`.
@@ -33,7 +39,8 @@ Shared-core shapes (`account`, `account_type`, `mandate_reason_code`) come from 
 
 ## Prerequisites
 
-- Java 25 (Gradle toolchain; wrapper included)
+- Java 25: `.sdkmanrc` pins `java=25-tem` (`sdk env`); `build.gradle` sets source and target compatibility 25
+- Gradle 9.5.1 via the included wrapper (`gradle/wrapper/gradle-wrapper.properties`)
 - Docker (Testcontainers CockroachDB for tests, image build for deployment)
 - Platform libs in Maven Local: `za.co.fnb.dcre:platform-persistence:0.1.0` and `za.co.fnb.dcre:platform-batch:0.1.0`
 
@@ -58,7 +65,7 @@ java -jar build/libs/mix-2.0.jar \
 
 ## Configuration
 
-Env over committed dev defaults (`application.yml`); precedence: yml default < environment.
+Env over committed dev defaults (`application.yml`, the only profile); precedence: yml default < environment. The table is the documented set, not a closed total: Spring Boot relaxed binding lets any property be overridden by its derived environment variable name (for example `dcre.batch.table-prefix` as `DCRE_BATCH_TABLEPREFIX`).
 
 | Env | Default | Purpose |
 |---|---|---|
@@ -68,7 +75,7 @@ Env over committed dev defaults (`application.yml`); precedence: yml default < e
 | `DCRE_AGTOPS_DB_URL` | `jdbc:postgresql://localhost:26257/agt_ops?sslmode=disable` | Heartbeat datasource (`agt_ops.launch_intent` liveness stamp) |
 | `DCRE_AGTOPS_DB_USER` | `root` | Heartbeat DB username |
 | `DCRE_AGTOPS_DB_PASSWORD` | (empty) | Heartbeat DB password |
-| `DCRE_EXCHANGE_ROOT` | `../../../../../infra/dcre-infra/exchange` | Exchange root for the outcome seam |
+| `DCRE_EXCHANGE_ROOT` | `../../../../../../infra/dcre-infra/exchange` | Exchange root for the outcome seam |
 | `JOB_NAME` | `local-mix-<executionId>` | Set by AGT on the K8s Job; names the outcome seam file |
 
 JobParameters: `arrival.id` (identifying, R-16), `input.file` and `original.name` (non-identifying; `original.name` becomes the `response_file` identity column). There is no `reply.type` parameter.
@@ -76,10 +83,11 @@ JobParameters: `arrival.id` (identifying, R-16), `input.file` and `original.name
 ## Testing
 
 ```bash
-./gradlew test   # needs Docker
+./gradlew test   # needs Docker; runs JUnit, Testcontainers ITs and the Cucumber suite
+./gradlew test --tests '*MixReaderIT'   # one suite
 ```
 
-One Testcontainers CockroachDB container serves the whole module (`AbstractCrdbIT.CRDB`); suites are isolated by disjoint fixture keys, and the convergence harness mints a virgin database per test.
+Pinned test image: `cockroachdb/cockroach:v26.2.3` (`AbstractCrdbIT`). One Testcontainers CockroachDB container serves the whole module (`AbstractCrdbIT.CRDB`); suites are isolated by disjoint fixture keys, and the convergence harness mints a virgin database per test.
 
 - `MixJobTest`: the real `mixJob` through `JobOperator` on Testcontainers CockroachDB `v26.2.3`; a job launched with nothing but the file lands the ISR leg, a rejected leg keeps its reason code, and a replay under a fresh job instance stays at one row.
 - `MixReaderIT`: reader proofs against real CRDB; the ingest lands in the one owned table, correlation persists every reply field, an unknown outbound identity is WARNed and excluded with nothing written, and a re-ingest is a zero-duplicate no-op preserving row identity.
@@ -96,7 +104,7 @@ docker build -t dcre-mix:<version> .
 kind load docker-image --name dcre-dev dcre-mix:<version>
 ```
 
-The image is `eclipse-temurin:25-jre-alpine`. AGT launches MIX as an ephemeral K8s Job in the `dcre` namespace whenever a `_ISR` reply lands in a per-client `fint-resp-man/in` directory, resolving the image from its `AGT_MIX_IMAGE` env (managed fleet-wide by dcre-infra `scripts/switch-version.sh`, which exports the mandates stages only from the 2.3 release line). Releases are digits-only 3-component SemVer tags, uniform across the fleet.
+The image is `eclipse-temurin:25-jre-alpine` running `build/libs/mix-2.0.jar`. AGT launches MIX as an ephemeral K8s Job in the mandates flow namespace (`agt.namespace-man`, env `AGT_NAMESPACE_MAN`, default `dcre-man`), named `man-mix-<arrival id without dashes>`, whenever a `_ISR` reply lands in a per-client `fint-resp-man/in` directory. The image comes from AGT's `AGT_MIX_IMAGE` (empty default, which leaves the stage launch-disabled). Job arguments: `arrival.id=<uuid>` (identifying), `input.file` and `original.name` (non-identifying). Pod env: `DCRE_DB_URL` (AGT `AGT_MAN_SERVICE_DB_URL`, default `jdbc:postgresql://crdb.dcre.svc.cluster.local:26257/dcre_man?sslmode=disable`), `DCRE_EXCHANGE_ROOT=/exchange` (the `dcre-exchange` PVC), `JOB_NAME`, `DCRE_AGTOPS_DB_URL` and `DCRE_AGTOPS_DB_USER` (read from AGT on origin/dev, checked 2026-09-28). Image versions are set fleet-wide by dcre-infra `scripts/switch-version.sh`, which exports the mandates stages only from the 2.3 release line (checked 2026-09-28); the cluster itself is defined in dcre-infra. Releases are digits-only 3-component SemVer tags, uniform across the fleet.
 
 ## Related repositories
 
